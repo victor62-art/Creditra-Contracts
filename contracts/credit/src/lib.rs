@@ -15,7 +15,7 @@ mod config;
 pub mod events;
 mod freeze;
 mod lifecycle;
-pub mod math_utils;
+mod math_utils;
 mod query;
 mod risk;
 mod storage;
@@ -30,24 +30,27 @@ use crate::auth::require_admin_auth;
 use crate::events::{
     publish_admin_rotation_accepted, publish_admin_rotation_proposed,
     publish_borrower_blocked_event, publish_credit_line_event, publish_drawn_event,
-    publish_interest_accrued_event, publish_rate_formula_config_event, publish_repayment_event,
-    CreditLineEvent, DrawnEvent,
+    publish_interest_accrued_event, publish_repayment_event, CreditLineEvent, DrawnEvent,
     InterestAccruedEvent, RepaymentEvent,
 };
 use crate::math_utils::{mul_div, Rounding};
 use crate::storage::{
     admin_key, assert_not_paused, clear_reentrancy_guard, get_borrower_by_credit_line_id,
     is_borrower_blocked as storage_is_borrower_blocked, persist_credit_line, proposed_admin_key,
-    proposed_at_key, rate_cfg_key, rate_formula_key, set_borrower_blocked as storage_set_borrower_blocked,
+    proposed_at_key, rate_cfg_key, set_borrower_blocked as storage_set_borrower_blocked,
     set_borrower_unblocked, set_reentrancy_guard, DataKey, MAX_ENUMERATION_LIMIT,
 };
 use crate::types::{
     ContractError, CreditLineData, CreditStatus, GracePeriodConfig, GraceWaiverMode,
-    ProtocolConfig, RateChangeConfig, RateFormulaConfig,
+    RateChangeConfig,
 };
 use soroban_sdk::{contract, contractimpl, symbol_short, token, Address, Env, Symbol, Vec};
 
 pub const CONTRACT_API_VERSION: (u32, u32, u32) = (1, 0, 0);
+
+/// Maximum allowed protocol fee in basis points (1000 = 10%). Adjust if needed.
+const MAX_PROTOCOL_FEE_BPS: u32 = 1_000;
+
 
 #[allow(dead_code)]
 const SECONDS_PER_YEAR: u64 = 31_536_000;
@@ -378,6 +381,9 @@ impl Credit {
             amount
         };
 
+        let interest_repaid = effective_repay.min(credit_line.accrued_interest);
+        let _principal_repaid = effective_repay - interest_repaid;
+
         if effective_repay > 0 {
             let maybe_token: Option<Address> =
                 env.storage().instance().get(&DataKey::LiquidityToken);
@@ -391,26 +397,36 @@ impl Credit {
                 let token_client = token::Client::new(&env, &token_address);
                 let contract_address = env.current_contract_address();
 
-                let allowance = token_client.allowance(&borrower, &contract_address);
-                if allowance < effective_repay {
-                    clear_reentrancy_guard(&env);
-                    env.panic_with_error(ContractError::InsufficientRepaymentAllowance);
+                // Compute protocol fee only on the interest component.
+                let fee_bps: u32 = crate::storage::get_protocol_fee_bps(&env).unwrap_or(0);
+                let mut fee: i128 = 0;
+                if fee_bps > 0 && interest_repaid > 0 {
+                    fee = crate::math_utils::apply_bps(
+                        interest_repaid as u128,
+                        fee_bps,
+                        Rounding::Floor,
+                    ) as i128;
                 }
-                if token_client.balance(&borrower) < effective_repay {
-                    clear_reentrancy_guard(&env);
-                    env.panic_with_error(ContractError::InsufficientRepaymentBalance);
+
+                // Transfer fee portion into contract (treasury accumulator), then
+                // transfer remaining amount into the reserve.
+                if fee > 0 {
+                    token_client.transfer_from(&contract_address, &borrower, &contract_address, &fee);
+                    crate::storage::add_treasury_balance(&env, fee);
+                    crate::events::publish_fee_accrued_event(&env, crate::events::FeeAccruedEvent {
+                        borrower: borrower.clone(),
+                        fee_amount: fee,
+                        new_treasury_balance: crate::storage::get_treasury_balance(&env),
+                    });
                 }
-                token_client.transfer_from(
-                    &contract_address,
-                    &borrower,
-                    &reserve_address,
-                    &effective_repay,
-                );
+
+                let reserve_amount = effective_repay.saturating_sub(fee);
+                if reserve_amount > 0 {
+                    token_client.transfer_from(&contract_address, &borrower, &reserve_address, &reserve_amount);
+                }
             }
         }
 
-        let interest_repaid = effective_repay.min(credit_line.accrued_interest);
-        let _principal_repaid = effective_repay - interest_repaid;
         credit_line.accrued_interest = credit_line
             .accrued_interest
             .checked_sub(interest_repaid)
@@ -583,7 +599,59 @@ impl Credit {
         crate::storage::get_draw_min_interval(&env)
     }
 
-    
+    /// Set protocol fee in basis points (applied to interest portion of repayments).
+    /// Admin only. Fee is bounded by `MAX_PROTOCOL_FEE_BPS`.
+    pub fn set_protocol_fee_bps(env: Env, bps: u32) {
+        require_admin_auth(&env);
+        if bps > MAX_PROTOCOL_FEE_BPS {
+            env.panic_with_error(crate::types::ContractError::Overflow);
+        }
+        crate::storage::set_protocol_fee_bps(&env, bps);
+    }
+
+    /// Get configured protocol fee in basis points, if set.
+    pub fn get_protocol_fee_bps(env: Env) -> Option<u32> {
+        crate::storage::get_protocol_fee_bps(&env)
+    }
+
+    /// Configure the treasury address where withdrawn fees will be sent (admin only).
+    pub fn set_treasury(env: Env, admin: Address, treasury: Address) {
+        admin.require_auth();
+        require_admin_auth(&env);
+        crate::storage::set_treasury_address(&env, &treasury);
+    }
+
+    /// Get configured treasury address, if any.
+    pub fn get_treasury(env: Env) -> Option<Address> {
+        crate::storage::get_treasury_address(&env)
+    }
+
+    /// Withdraw accumulated treasury balance to configured treasury address (admin only).
+    pub fn withdraw_treasury(env: Env, admin: Address) {
+        admin.require_auth();
+        require_admin_auth(&env);
+
+        let treasury_addr = crate::storage::get_treasury_address(&env)
+            .unwrap_or_else(|| env.panic_with_error(crate::types::ContractError::TreasuryNotSet));
+
+        let amount = crate::storage::get_treasury_balance(&env);
+        if amount == 0 {
+            return;
+        }
+
+        let token_address: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::LiquidityToken)
+            .unwrap_or_else(|| env.panic_with_error(crate::types::ContractError::MissingLiquidityToken));
+
+        let token_client = token::Client::new(&env, &token_address);
+        let contract_address = env.current_contract_address();
+        token_client.transfer(&contract_address, &treasury_addr, &amount);
+
+        crate::storage::clear_treasury_balance(&env);
+    }
+
     /// Get the current storage schema version.
     pub fn get_schema_version(env: Env) -> Option<u32> {
         crate::storage::get_schema_version(&env)
@@ -880,105 +948,15 @@ impl Credit {
         freeze::is_draws_frozen(&env)
     }
 
-    /// Backward-compatible protocol pause API used by existing tests.
-    pub fn set_protocol_paused(env: Env, paused: bool) {
-        require_admin_auth(&env);
-        set_paused(&env, paused);
-        publish_paused_event(&env, paused);
-    }
-
-    pub fn is_protocol_paused(env: Env) -> bool {
-        crate::storage::is_paused(&env)
-    }
-
-    /// Returns all global protocol configuration in a single call.
-    ///
-    /// Useful for integrators who need to inspect the current state without
-    /// making multiple RPC calls. All fields are deterministic reads from
-    /// instance storage — no side effects.
-    ///
-    /// - `liquidity_token`: `None` until `set_liquidity_token` is called.
-    /// - `liquidity_source`: `None` until `init` is called (defaults to contract address).
-    /// - `rate_change_config`: `None` until `set_rate_change_limits` is called.
-    pub fn get_protocol_config(env: Env) -> ProtocolConfig {
-        let rate_cfg: Option<crate::types::RateChangeConfig> =
-            env.storage().instance().get(&rate_cfg_key(&env));
-        ProtocolConfig {
-            liquidity_token: env.storage().instance().get(&DataKey::LiquidityToken),
-            liquidity_source: env.storage().instance().get(&DataKey::LiquiditySource),
-            max_rate_change_bps: rate_cfg.as_ref().map(|c| c.max_rate_change_bps),
-            rate_change_min_interval: rate_cfg.map(|c| c.rate_change_min_interval),
-        }
-    }
-
-    /// Set the dynamic interest rate formula configuration (admin only).
-    ///
-    /// When set, `update_risk_parameters` ignores the `interest_rate_bps` argument
-    /// and computes the rate as: `clamp(base_rate_bps + risk_score * slope_bps_per_score, min_rate_bps, max_rate_bps)`.
-    pub fn set_rate_formula_config(
-        env: Env,
-        base_rate_bps: u32,
-        slope_bps_per_score: u32,
-        min_rate_bps: u32,
-        max_rate_bps: u32,
-    ) {
-        assert_not_paused(&env);
-        require_admin_auth(&env);
-        if base_rate_bps > risk::MAX_INTEREST_RATE_BPS {
-            env.panic_with_error(ContractError::RateTooHigh);
-        }
-        if max_rate_bps > risk::MAX_INTEREST_RATE_BPS {
-            env.panic_with_error(ContractError::RateTooHigh);
-        }
-        if min_rate_bps > max_rate_bps {
-            env.panic_with_error(ContractError::RateTooHigh);
-        }
-        let cfg = RateFormulaConfig {
-            base_rate_bps,
-            slope_bps_per_score,
-            min_rate_bps,
-            max_rate_bps,
-        };
-        env.storage().instance().set(&rate_formula_key(&env), &cfg);
-        publish_rate_formula_config_event(&env, true);
-    }
-
-    /// Get the current dynamic interest rate formula configuration, if set.
-    pub fn get_rate_formula_config(env: Env) -> Option<RateFormulaConfig> {
-        risk::get_rate_formula_config(env)
-    }
-
-    /// Clear the dynamic interest rate formula configuration (admin only).
-    ///
-    /// After clearing, `update_risk_parameters` reverts to using the manual `interest_rate_bps` parameter.
-    pub fn clear_rate_formula_config(env: Env) {
-        require_admin_auth(&env);
-        env.storage().instance().remove(&rate_formula_key(&env));
-        publish_rate_formula_config_event(&env, false);
-    }
-
-    /// Set the protocol-wide pause state (admin only).
-    ///
-    /// When paused (`true`), all mutating operations except `repay_credit` are blocked.
-    /// Unpause by calling with `false`.
-    pub fn set_protocol_paused(env: Env, paused: bool) {
-        require_admin_auth(&env);
-        crate::storage::set_paused(&env, paused);
-        crate::events::publish_paused_event(&env, paused);
-    }
-
-    /// Check whether the protocol is currently paused.
-    pub fn is_protocol_paused(env: Env) -> bool {
-        crate::storage::is_paused(&env)
-    }
-
-    /// Return the contract's API version as a (major, minor, patch) tuple.
-    pub fn get_contract_version(env: Env) -> (u32, u32, u32) {
-        let _ = env;
-        CONTRACT_API_VERSION
-    }
 }
-}
+
+
+
+
+
+
+
+
 #[cfg(test)]
 mod test_rate_change_limits {
     use super::*;
@@ -4285,4 +4263,170 @@ pub mod test_coverage {
             client.set_max_repay_amount(&0_i128);
         }
     }
-} // closes mod test_coverage
+
+    #[test]
+    fn test_get_utilization_cap_returns_set_value() {
+        let env = Env::default();
+        let (client, borrower, _) = setup_with_cap_env(&env, 1_000);
+        assert!(client.get_utilization_cap(&borrower).is_none());
+        client.set_utilization_cap(&borrower, &7_500_u32);
+        assert_eq!(client.get_utilization_cap(&borrower), Some(7_500_u32));
+    }
+
+    #[test]
+    fn test_cap_at_100_percent_allows_full_limit() {
+        let env = Env::default();
+        let (client, borrower, _) = setup_with_cap_env(&env, 1_000);
+        client.set_utilization_cap(&borrower, &10_000_u32);
+        client.draw_credit(&borrower, &1_000_i128);
+        assert_eq!(
+            client.get_credit_line(&borrower).unwrap().utilized_amount,
+            1_000_i128
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "cap_bps must be <= 10000")]
+    fn test_set_cap_above_10000_reverts() {
+        let env = Env::default();
+        let (client, borrower, _) = setup_with_cap_env(&env, 1_000);
+        client.set_utilization_cap(&borrower, &10_001_u32);
+    }
+
+    #[test]
+    fn test_cap_is_per_borrower_independent() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let borrower_a = Address::generate(&env);
+        let borrower_b = Address::generate(&env);
+        let contract_id = env.register(Credit, ());
+        let client = CreditClient::new(&env, &contract_id);
+        client.init(&admin);
+        let liquidity = MockLiquidityToken::deploy(&env);
+        liquidity.mint(&contract_id, 2_000);
+        client.set_liquidity_token(&liquidity.address());
+        client.open_credit_line(&borrower_a, &1_000_i128, &300_u32, &50_u32);
+        client.open_credit_line(&borrower_b, &1_000_i128, &300_u32, &50_u32);
+        client.set_utilization_cap(&borrower_a, &5_000_u32);
+        client.draw_credit(&borrower_b, &1_000_i128);
+        assert_eq!(
+            client.get_credit_line(&borrower_b).unwrap().utilized_amount,
+            1_000_i128
+        );
+        client.draw_credit(&borrower_a, &500_i128);
+        assert_eq!(
+            client.get_credit_line(&borrower_a).unwrap().utilized_amount,
+            500_i128
+        );
+    }
+
+    #[test]
+    fn test_cap_boundary_exact_draw_succeeds() {
+        let env = Env::default();
+        let (client, borrower, _) = setup_with_cap_env(&env, 500);
+        client.set_utilization_cap(&borrower, &6_000_u32);
+        client.draw_credit(&borrower, &300_i128);
+        assert_eq!(
+            client.get_credit_line(&borrower).unwrap().utilized_amount,
+            300_i128
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "exceeds utilization cap")]
+    fn test_cap_boundary_one_over_reverts() {
+        let env = Env::default();
+        let (client, borrower, _) = setup_with_cap_env(&env, 500);
+        client.set_utilization_cap(&borrower, &6_000_u32);
+        client.draw_credit(&borrower, &301_i128);
+    }
+}
+
+#[cfg(test)]
+mod test_max_repay_amount {
+    use super::*;
+    use crate::types::ContractError;
+    use soroban_sdk::testutils::Address as _;
+    use soroban_sdk::token::StellarAssetClient;
+    use soroban_sdk::Env;
+
+    fn setup_with_token(env: &Env) -> (CreditClient, Address, Address, Address) {
+        env.mock_all_auths();
+        let admin = Address::generate(env);
+        let borrower = Address::generate(env);
+        let contract_id = env.register(Credit, ());
+        let client = CreditClient::new(env, &contract_id);
+        client.init(&admin);
+
+        let token_id = env.register_stellar_asset_contract_v2(Address::generate(env));
+        let token = token_id.address();
+        client.set_liquidity_token(&token);
+
+        // Mint to contract to allow draw
+        StellarAssetClient::new(env, &token).mint(&contract_id, &5_000_i128);
+
+        client.open_credit_line(&borrower, &1_000_i128, &300_u32, &70_u32);
+
+        // Draw some credit to repay later
+        client.draw_credit(&borrower, &500_i128);
+
+        // Mint to borrower so they have funds to repay
+        StellarAssetClient::new(env, &token).mint(&borrower, &5_000_i128);
+
+        (client, admin, borrower, token)
+    }
+
+    #[test]
+    fn test_unset_max_repay_amount_allows_any() {
+        let env = Env::default();
+        let (client, _admin, borrower, _token) = setup_with_token(&env);
+
+        assert_eq!(client.get_max_repay_amount(), None);
+
+        client.repay_credit(&borrower, &400_i128);
+        let line = client.get_credit_line(&borrower).unwrap();
+        assert_eq!(line.utilized_amount, 100);
+    }
+
+    #[test]
+    fn test_set_and_get_max_repay_amount() {
+        let env = Env::default();
+        let (client, _admin, _borrower, _token) = setup_with_token(&env);
+
+        client.set_max_repay_amount(&300_i128);
+        assert_eq!(client.get_max_repay_amount(), Some(300_i128));
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Contract, #28)")]
+    fn test_repay_exceeds_max_cap_reverts() {
+        let env = Env::default();
+        let (client, _admin, borrower, _token) = setup_with_token(&env);
+
+        client.set_max_repay_amount(&300_i128);
+        client.repay_credit(&borrower, &400_i128);
+    }
+
+    #[test]
+    fn test_repay_within_max_cap_succeeds() {
+        let env = Env::default();
+        let (client, _admin, borrower, _token) = setup_with_token(&env);
+
+        client.set_max_repay_amount(&300_i128);
+        client.repay_credit(&borrower, &300_i128);
+        let line = client.get_credit_line(&borrower).unwrap();
+        assert_eq!(line.utilized_amount, 200);
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Contract, #5)")]
+    fn test_set_max_repay_amount_zero_or_negative() {
+        let env = Env::default();
+        let (client, _admin, _borrower, _token) = setup_with_token(&env);
+
+        client.set_max_repay_amount(&0_i128);
+        }
+    }
+
+    }
