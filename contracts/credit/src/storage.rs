@@ -35,6 +35,9 @@ pub enum DataKey {
     /// Per-borrower max utilization ratio cap in basis points (e.g. 8000 = 80%).
     /// When set, draw_credit enforces: utilized_amount <= credit_limit * cap_bps / 10_000.
     UtilizationCapBps(Address),
+    /// Per-borrower interest rate floor in basis points.
+    /// When set, the effective interest rate must be >= floor.
+    RateFloorBps(Address),
     /// Per-borrower installment schedule for delinquency tracking.
     RepaymentSchedule(Address),
     CollateralToken,
@@ -315,9 +318,28 @@ pub fn is_borrower_blocked(env: &Env, borrower: &Address) -> bool {
     }
 }
 
-/// Get the collateral token address, if set.
-pub fn get_collateral_token(env: &Env) -> Option<Address> {
-    env.storage().instance().get(&DataKey::LiquidityToken)
+/// Get the interest rate floor for a borrower, if set.
+pub fn get_borrower_rate_floor(env: &Env, borrower: &Address) -> Option<u32> {
+    env.storage()
+        .persistent()
+        .get(&DataKey::RateFloorBps(borrower.clone()))
+}
+
+/// Set or clear the interest rate floor for a borrower.
+pub fn set_borrower_rate_floor(env: &Env, borrower: &Address, floor: Option<u32>) {
+    let key = DataKey::RateFloorBps(borrower.clone());
+    if let Some(floor) = floor {
+        env.storage().persistent().set(&key, &floor);
+    } else {
+        env.storage().persistent().remove(&key);
+    }
+}
+
+/// Get the configured minimum draw interval in seconds.
+pub fn get_draw_min_interval(env: &Env) -> Option<u64> {
+    env.storage()
+        .instance()
+        .get(&DataKey::DrawMinIntervalSeconds)
 }
 
 /// Set the collateral token address (admin only).
