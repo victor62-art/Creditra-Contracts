@@ -61,7 +61,10 @@ pub enum CreditStatus {
 /// | 27   | `InsufficientRepaymentBalance` | Borrower balance cannot cover repayment |
 /// | 28   | `RepayExceedsMaxAmount`        | Repay amount exceeds per-transaction cap |
 /// | 29   | `DrawCooldownActive`          | Borrower attempted to draw before cooldown elapsed |
-/// | 30   | `ExposureCapExceeded`         | Draw would exceed the global protocol exposure cap |
+/// | 30   | `TreasuryNotSet`              | Treasury address is not configured |
+/// | 31   | `ExposureCapExceeded`         | Draw would exceed the global protocol exposure cap |
+/// | 32   | `AdminNotInitialized`         | Admin address has not been initialized |
+/// | 33   | `TimestampRegression`         | Timestamp regression detected |
 #[soroban_sdk::contracterror]
 #[derive(Clone, Copy, Debug, Eq, PartialEq, PartialOrd, Ord)]
 #[repr(u32)]
@@ -126,6 +129,12 @@ pub enum ContractError {
     DrawCooldownActive = 29,
     /// Treasury address is not configured when attempting a treasury withdrawal.
     TreasuryNotSet = 30,
+    /// Draw would exceed the global protocol exposure cap.
+    ExposureCapExceeded = 31,
+    /// Admin address has not been initialized in contract storage.
+    AdminNotInitialized = 32,
+    /// Timestamp regression detected (new timestamp is not greater than stored timestamp).
+    TimestampRegression = 33,
 }
 
 /// Stored credit line data for a borrower.
