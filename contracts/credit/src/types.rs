@@ -7,18 +7,33 @@
 use soroban_sdk::{contracttype, Address};
 
 /// Status of a borrower's credit line.
+///
+/// # Discriminant stability
+/// The discriminants are part of the contract ABI. They must never be
+/// reordered or renumbered; new variants must be appended.
+///
+/// # Transitions
+/// See [`docs/state-machine.md`](../../../docs/state-machine.md) for the
+/// authoritative state-transition diagram. In short:
+///
+/// - `Active` is the only state that permits new draws.
+/// - `Restricted` allows draws but the numeric limit check will fail until
+///   the borrower repays under the reduced ceiling.
+/// - `Suspended` and `Defaulted` both block draws and allow repayments.
+/// - `Closed` is terminal — no draws, no repayments.
 #[contracttype]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CreditStatus {
-    /// Credit line is active and draws are allowed.
+    /// Credit line is active; draws and repayments allowed.
     Active = 0,
-    /// Credit line is temporarily frozen by admin.
+    /// Credit line is temporarily frozen by admin. Draws blocked, repayments allowed.
     Suspended = 1,
-    /// Credit line is in default; draws are disabled.
+    /// Credit line is in default; draws blocked, repayments allowed for cure.
     Defaulted = 2,
-    /// Credit line is permanently closed.
+    /// Credit line is permanently closed. Draws blocked, repayments blocked.
     Closed = 3,
     /// Credit limit was decreased below utilized amount; excess must be repaid.
+    /// Draws are not flat-blocked but will fail the numeric limit check until cured.
     Restricted = 4,
 }
 
