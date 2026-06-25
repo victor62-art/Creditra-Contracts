@@ -4,7 +4,18 @@ mod settlement_tests {
 
     use crate::{CalloraSettlement, CalloraSettlementClient, SettlementError, StorageKey};
     use soroban_sdk::testutils::{Address as _, Ledger as _};
-    use soroban_sdk::{Address, Env, InvokeError};
+    use soroban_sdk::{token, Address, Env, InvokeError};
+
+    fn create_usdc<'a>(
+        env: &'a Env,
+        admin: &Address,
+    ) -> (Address, token::Client<'a>, token::StellarAssetClient<'a>) {
+        let contract_address = env.register_stellar_asset_contract_v2(admin.clone());
+        let address = contract_address.address();
+        let client = token::Client::new(env, &address);
+        let admin_client = token::StellarAssetClient::new(env, &address);
+        (address, client, admin_client)
+    }
 
     fn setup_contract() -> (Env, Address, Address, Address, Address) {
         let env = Env::default();
@@ -267,7 +278,7 @@ mod settlement_tests {
         client.receive_payment(&vault, &100i128, &false, &Some(developer.clone()));
         usdc_admin_client.mint(&addr, &100i128);
 
-        let result = client.try_withdraw_developer_balance(&developer, &100i128);
+        let result = client.try_withdraw_developer_balance(&developer, &100i128, &None);
         assert!(result.is_ok());
         assert_eq!(client.get_developer_balance(&developer), 0i128);
         assert_eq!(token::Client::new(&env, &usdc_address).balance(&addr), 0i128);
@@ -290,7 +301,7 @@ mod settlement_tests {
         client.receive_payment(&vault, &100i128, &false, &Some(developer.clone()));
         usdc_admin_client.mint(&addr, &100i128);
 
-        let result = client.try_withdraw_developer_balance(&developer, &101i128);
+        let result = client.try_withdraw_developer_balance(&developer, &101i128, &None);
         assert!(result.is_err());
         assert_eq!(client.get_developer_balance(&developer), 100i128);
     }
@@ -307,8 +318,8 @@ mod settlement_tests {
 
         client.init(&admin, &vault);
 
-        let zero_result = client.try_withdraw_developer_balance(&developer, &0i128);
-        let negative_result = client.try_withdraw_developer_balance(&developer, &-1i128);
+        let zero_result = client.try_withdraw_developer_balance(&developer, &0i128, &None);
+        let negative_result = client.try_withdraw_developer_balance(&developer, &-1i128, &None);
 
         assert!(zero_result.is_err());
         assert!(negative_result.is_err());
@@ -333,7 +344,7 @@ mod settlement_tests {
         client.receive_payment(&vault, &200i128, &false, &Some(developer.clone()));
         usdc_admin_client.mint(&addr, &200i128);
 
-        let result = client.try_withdraw_developer_balance(&developer, &200i128);
+        let result = client.try_withdraw_developer_balance(&developer, &200i128, &None);
         assert!(result.is_ok());
 
         let events = env.events().all();
@@ -354,6 +365,52 @@ mod settlement_tests {
         assert_eq!(data.developer, developer);
         assert_eq!(data.amount, 200i128);
         assert_eq!(data.remaining_balance, 0i128);
+        assert_eq!(data.to, developer);
+    }
+
+    #[test]
+    fn test_withdraw_developer_balance_to_different_recipient() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let vault = Address::generate(&env);
+        let developer = Address::generate(&env);
+        let recipient = Address::generate(&env);
+        let addr = env.register(CalloraSettlement, ());
+        let client = CalloraSettlementClient::new(&env, &addr);
+        let (usdc_address, _, usdc_admin_client) = create_usdc(&env, &admin);
+
+        client.init(&admin, &vault);
+        client.set_usdc_token(&admin, &usdc_address);
+        client.receive_payment(&vault, &150i128, &false, &Some(developer.clone()));
+        usdc_admin_client.mint(&addr, &150i128);
+
+        let result = client.try_withdraw_developer_balance(&developer, &150i128, &Some(recipient.clone()));
+        assert!(result.is_ok());
+        assert_eq!(client.get_developer_balance(&developer), 0i128);
+        assert_eq!(token::Client::new(&env, &usdc_address).balance(&addr), 0i128);
+        assert_eq!(token::Client::new(&env, &usdc_address).balance(&recipient), 150i128);
+    }
+
+    #[test]
+    #[should_panic(expected = "invalid recipient: cannot withdraw to contract address")]
+    fn test_withdraw_developer_balance_rejects_contract_address() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let vault = Address::generate(&env);
+        let developer = Address::generate(&env);
+        let addr = env.register(CalloraSettlement, ());
+        let client = CalloraSettlementClient::new(&env, &addr);
+        let (usdc_address, _, usdc_admin_client) = create_usdc(&env, &admin);
+
+        client.init(&admin, &vault);
+        client.set_usdc_token(&admin, &usdc_address);
+        client.receive_payment(&vault, &100i128, &false, &Some(developer.clone()));
+        usdc_admin_client.mint(&addr, &100i128);
+
+        // Try to withdraw to the contract address
+        client.try_withdraw_developer_balance(&developer, &100i128, &Some(addr.clone()));
     }
 
     #[test]

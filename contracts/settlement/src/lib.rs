@@ -126,6 +126,7 @@ pub struct DeveloperWithdrawEvent {
     pub developer: Address,
     pub amount: i128,
     pub remaining_balance: i128,
+    pub to: Address,
 }
 
 
@@ -435,14 +436,16 @@ impl CalloraSettlement {
             .ok_or(SettlementError::UsdcTokenNotConfigured)
     }
 
-    /// Withdraw developer balance as USDC to the requesting developer.
+    /// Withdraw developer balance as USDC to the requesting developer or a specified recipient.
     ///
     /// Requires the developer to authorize the request and the requested amount
     /// to be positive and covered by the tracked developer balance.
+    /// If `to` is not provided, defaults to the developer address.
     pub fn withdraw_developer_balance(
         env: Env,
         developer: Address,
         amount: i128,
+        to: Option<Address>,
     ) -> Result<(), SettlementError> {
         developer.require_auth();
         if amount <= 0 {
@@ -470,7 +473,12 @@ impl CalloraSettlement {
             return Err(SettlementError::InsufficientContractBalance);
         }
 
-        usdc.transfer(&contract_address, &developer, &amount);
+        let recipient = to.unwrap_or_else(|| developer.clone());
+        if recipient == contract_address {
+            panic!("invalid recipient: cannot withdraw to contract address");
+        }
+
+        usdc.transfer(&contract_address, &recipient, &amount);
 
         env.storage()
             .persistent()
@@ -485,6 +493,7 @@ impl CalloraSettlement {
                 developer,
                 amount,
                 remaining_balance: new_balance,
+                to: recipient,
             },
         );
 

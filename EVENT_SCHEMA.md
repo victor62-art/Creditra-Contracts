@@ -1,4 +1,4 @@
-﻿# Event Schema
+# Event Schema
 
 Events emitted by all Callora contracts for indexers, frontends, and auditors.
 All topic/data types refer to Soroban/Stellar XDR values.
@@ -792,6 +792,33 @@ after the matching `payment_received` event.
 
 ---
 
+### `developer_withdraw`
+
+Emitted by `withdraw_developer_balance()` when a developer withdraws their balance.
+
+| Index             | Location | Type    | Description                                                                      |
+|-------------------|----------|---------|----------------------------------------------------------------------------------|
+| topic 0           | topics   | Symbol  | `"developer_withdraw"`                                                           |
+| topic 1           | topics   | Address | `developer` — address whose balance is being withdrawn (and who authorized call) |
+| `developer`       | data     | Address | same as topic 1; duplicated for data-only indexers                               |
+| `amount`          | data     | i128    | amount withdrawn in USDC micro-units; invariant `amount > 0`                     |
+| `remaining_balance` | data   | i128    | developer's remaining balance after this withdrawal (post-state)                 |
+| `to`              | data     | Address | recipient address (defaults to `developer` if not provided)                      |
+
+```json
+{
+  "topics": ["developer_withdraw", "GDEV..."],
+  "data": {
+    "developer": "GDEV...",
+    "amount": 1000000,
+    "remaining_balance": 500000,
+    "to": "GRECIPIENT..."
+  }
+}
+```
+
+---
+
 ### `vault_changed`
 
 Emitted by `set_vault()` when the admin updates the registered vault address.
@@ -844,6 +871,7 @@ Emitted by `set_vault()` when the admin updates the registered vault address.
 | `batch_distribute`       | revenue-pool    | each payment in `batch_distribute()`     |
 | `payment_received`       | settlement      | `receive_payment()`                      |
 | `balance_credited`       | settlement      | `receive_payment()` with `to_pool=false` |
+| `developer_withdraw`     | settlement      | `withdraw_developer_balance()`           |
 | `vault_changed`          | settlement      | `set_vault()`                            |
 
 ---
